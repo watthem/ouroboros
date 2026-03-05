@@ -74,11 +74,13 @@ If the `ouroboros_interview` MCP tool is available, use it for persistent, struc
 If the MCP tool is NOT available, fall back to agent-based interview:
 
 1. Read `agents/socratic-interviewer.md` and adopt that role
-2. Ask clarifying questions based on the user's topic
-3. **Present each question using AskUserQuestion** with contextually relevant suggested answers (same format as Path A step 2)
-4. Use Read, Glob, Grep, WebFetch to explore context if needed
-5. Continue until the user says "done"
-6. Interview results live in conversation context (not persisted)
+2. Quickly read key repo files first (`src`, `pyproject`, recent docs) to infer existing patterns and avoid asking already-determinable questions.
+3. Ask clarifying questions based on the user's topic
+4. Convert open-ended findings into confirmation-style questions when evidence exists (e.g., "I see JWT auth in `src/auth/`; should we reuse it?")
+5. **Present each question using AskUserQuestion** with contextually relevant suggested answers (same format as Path A step 2)
+6. Use Read, Glob, Grep, WebFetch to explore context if needed
+7. Continue until the user says "done"
+8. Interview results live in conversation context (not persisted)
 
 ## Interviewer Behavior (Both Modes)
 

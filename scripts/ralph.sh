@@ -15,6 +15,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RALPH_PY="${SCRIPT_DIR}/ralph.py"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 # ── Defaults ────────────────────────────────────────────────────────────────
 LINEAGE_ID=""
@@ -26,6 +27,9 @@ NO_PARALLEL=false
 NO_QA=false
 SERVER_COMMAND=""
 SERVER_ARGS=""
+PR_WORKFLOW=false
+WORK_BRANCH=""
+BASE_BRANCH=""
 
 # ── Usage ───────────────────────────────────────────────────────────────────
 usage() {
@@ -79,6 +83,59 @@ fi
 # ── Helpers ─────────────────────────────────────────────────────────────────
 log() {
     echo "[ralph] $(date '+%H:%M:%S') $*" >&2
+}
+
+infer_pr_workflow() {
+    local claude_md="${PROJECT_ROOT}/CLAUDE.md"
+    if [[ ! -f "$claude_md" ]]; then
+        return
+    fi
+
+    if grep -qiE "PR-based workflow|Never commit directly to main|Always create a branch|Create pull request" "$claude_md"; then
+        PR_WORKFLOW=true
+        BASE_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)"
+        log "Detected PR workflow in CLAUDE.md; will use branch strategy"
+    fi
+}
+
+init_pr_branch() {
+    if [[ "$PR_WORKFLOW" != true ]]; then
+        return
+    fi
+    if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        log "Not a git repository; skipping branch setup"
+        return
+    fi
+
+    WORK_BRANCH="ooo/ralph/${LINEAGE_ID}"
+    if git rev-parse --verify "refs/heads/$WORK_BRANCH" >/dev/null 2>&1; then
+        if git checkout "$WORK_BRANCH" >/dev/null 2>&1; then
+            log "Using existing workflow branch ${WORK_BRANCH}"
+            return
+        fi
+        log "Failed to checkout ${WORK_BRANCH}; continuing on current branch"
+        PR_WORKFLOW=false
+        WORK_BRANCH=""
+        return
+    fi
+
+    if ! git checkout -b "$WORK_BRANCH" >/dev/null 2>&1; then
+        log "Failed to create workflow branch ${WORK_BRANCH}; continuing on current branch"
+        PR_WORKFLOW=false
+        WORK_BRANCH=""
+    else
+        log "Created workflow branch ${WORK_BRANCH}"
+    fi
+}
+
+summarize_pr_next_steps() {
+    if [[ "$PR_WORKFLOW" != true || -z "$WORK_BRANCH" ]]; then
+        return
+    fi
+
+    log "PR workflow active: branch=${WORK_BRANCH}"
+    log "Push branch with: git push -u origin ${WORK_BRANCH}"
+    log "Create PR with: gh pr create --base ${BASE_BRANCH:-main} --head ${WORK_BRANCH} --title \"feat(${LINEAGE_ID}): complete ralph loop\" --body \"Automated changes from ooo ralph\""
 }
 
 # Commit changes and create a git tag for the generation.
@@ -168,6 +225,9 @@ build_py_args() {
 cycle=0
 stagnation_count=0
 
+infer_pr_workflow
+init_pr_branch
+
 log "Starting Ralph loop for lineage=${LINEAGE_ID} max_cycles=${MAX_CYCLES}"
 
 while (( cycle < MAX_CYCLES )); do
@@ -225,6 +285,7 @@ while (( cycle < MAX_CYCLES )); do
             ;;
         converged)
             log "CONVERGED at generation ${generation} (similarity=${similarity})"
+            summarize_pr_next_steps
             echo "$output"
             exit 0
             ;;
@@ -235,12 +296,14 @@ while (( cycle < MAX_CYCLES )); do
             # If still stagnated after that, we count it here.
             if (( stagnation_count >= MAX_RETRIES )); then
                 log "Stagnation limit reached (${stagnation_count}/${MAX_RETRIES})"
+                summarize_pr_next_steps
                 echo "$output"
                 exit 10
             fi
             ;;
         exhausted)
             log "EXHAUSTED — max generations reached in evolve_step"
+            summarize_pr_next_steps
             echo "$output"
             exit 11
             ;;
@@ -249,11 +312,13 @@ while (( cycle < MAX_CYCLES )); do
             if [[ -n "$generation" ]] && [[ "$generation" != "None" ]]; then
                 rollback_to_previous "$generation"
             fi
+            summarize_pr_next_steps
             echo "$output"
             exit 12
             ;;
         *)
             log "Unknown action '${action}', treating as failure"
+            summarize_pr_next_steps
             echo "$output"
             exit 12
             ;;
@@ -261,5 +326,6 @@ while (( cycle < MAX_CYCLES )); do
 done
 
 log "Max cycles (${MAX_CYCLES}) reached without convergence"
+summarize_pr_next_steps
 echo "$output"
 exit 14

@@ -53,6 +53,9 @@ When the user invokes this skill:
    - Show success/failure status
    - Show session ID (for later status checks)
    - Show execution summary
+   - Always include one concrete next command:
+     - On SUCCESS: `ooo evaluate <session_id>`
+     - On FAIL/REVISE: `ooo run <seed or session>` after fixes, or `ooo ralph` for persistent repair
 
 5. **Post-execution QA** (automatic):
    `ouroboros_execute_seed` automatically runs QA after successful execution.
