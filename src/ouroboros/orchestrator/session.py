@@ -22,6 +22,7 @@ Usage:
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -35,6 +36,7 @@ from ouroboros.observability.logging import get_logger
 
 if TYPE_CHECKING:
     from ouroboros.persistence.event_store import EventStore
+    from ouroboros.persistence.session_projector import SessionProjector
 
 log = get_logger(__name__)
 
@@ -193,13 +195,19 @@ class SessionRepository:
         - orchestrator.session.paused: Session paused for resumption
     """
 
-    def __init__(self, event_store: EventStore) -> None:
+    def __init__(
+        self,
+        event_store: EventStore,
+        projector: SessionProjector | None = None,
+    ) -> None:
         """Initialize repository with event store.
 
         Args:
             event_store: Event store for persistence.
+            projector: Optional session projector for O(1) reads.
         """
         self._event_store = event_store
+        self._projector = projector
 
     async def create_session(
         self,
@@ -209,15 +217,40 @@ class SessionRepository:
     ) -> Result[SessionTracker, PersistenceError]:
         """Create a new session and persist start event.
 
+        Idempotent: if a session with the given session_id already exists,
+        returns the existing tracker instead of creating a duplicate.
+
         Args:
             execution_id: Workflow execution ID.
             seed_id: Seed ID being executed.
             session_id: Optional custom session ID.
 
         Returns:
-            Result containing new SessionTracker.
+            Result containing new or existing SessionTracker.
         """
         tracker = SessionTracker.create(execution_id, seed_id, session_id)
+
+        # Idempotency guard: check for existing session.started event
+        if session_id is not None:
+            try:
+                existing_events = await self._event_store.replay(
+                    "session", session_id
+                )
+                has_start = any(
+                    e.type == "orchestrator.session.started"
+                    for e in existing_events
+                )
+                if has_start:
+                    log.info(
+                        "orchestrator.session.create_idempotent",
+                        session_id=session_id,
+                        execution_id=execution_id,
+                    )
+                    result = await self.reconstruct_session(session_id)
+                    if result.is_ok:
+                        return result
+            except Exception:
+                pass  # Fall through to create
 
         event = BaseEvent(
             type="orchestrator.session.started",
@@ -398,6 +431,73 @@ class SessionRepository:
         Returns:
             Result containing reconstructed SessionTracker.
         """
+        t0 = time.monotonic()
+
+        # Try projection path first
+        if self._projector is not None:
+            try:
+                projection = await self._projector.read(session_id)
+                if projection is not None:
+                    # Check freshness via a lightweight query for the latest event ID
+                    from sqlalchemy import select as sa_select
+                    from ouroboros.persistence.schema import events_table
+                    async with self._event_store._engine.begin() as conn:
+                        result = await conn.execute(
+                            sa_select(events_table.c.id)
+                            .where(events_table.c.aggregate_type == "session")
+                            .where(events_table.c.aggregate_id == session_id)
+                            .order_by(events_table.c.timestamp.desc(), events_table.c.id.desc())
+                            .limit(1)
+                        )
+                        latest_event_id = result.scalar()
+
+                    if (
+                        latest_event_id
+                        and projection.get("last_event_id") == latest_event_id
+                    ):
+                        # Projection is fresh — construct tracker from it
+                        try:
+                            tracker = SessionTracker(
+                                session_id=session_id,
+                                execution_id=projection["execution_id"],
+                                seed_id=projection["seed_id"],
+                                status=SessionStatus(projection["status"]),
+                                start_time=(
+                                    datetime.fromisoformat(projection["start_time"])
+                                    if isinstance(projection["start_time"], str)
+                                    else projection["start_time"]
+                                ),
+                                progress=projection.get("last_progress") or {},
+                                messages_processed=projection.get("messages_processed", 0),
+                            )
+                            duration_ms = (time.monotonic() - t0) * 1000
+                            log.info(
+                                "orchestrator.session.reconstructed",
+                                session_id=session_id,
+                                status=tracker.status.value,
+                                messages_processed=tracker.messages_processed,
+                                event_count_replayed=0,
+                                duration_ms=round(duration_ms, 2),
+                                path="projection",
+                            )
+                            return Result.ok(tracker)
+                        except (KeyError, ValueError):
+                            # Corrupt projection — fall through to replay
+                            log.warning(
+                                "session.projection.corrupt_fallback",
+                                session_id=session_id,
+                            )
+                    else:
+                        log.info(
+                            "session.projection.stale_fallback",
+                            session_id=session_id,
+                        )
+            except Exception:
+                log.warning(
+                    "session.projection.read_failed",
+                    session_id=session_id,
+                )
+
         try:
             events = await self._event_store.replay("session", session_id)
 
@@ -456,20 +556,36 @@ class SessionRepository:
                 messages_processed=messages_processed,
             )
 
+            duration_ms = (time.monotonic() - t0) * 1000
             log.info(
                 "orchestrator.session.reconstructed",
                 session_id=session_id,
                 status=tracker.status.value,
                 messages_processed=messages_processed,
+                event_count_replayed=len(events),
+                duration_ms=round(duration_ms, 2),
+                path="replay",
             )
+
+            # Rebuild projection as side effect so next read is O(1)
+            if self._projector is not None:
+                try:
+                    await self._projector.rebuild(self._event_store, session_id)
+                except Exception:
+                    log.warning(
+                        "session.projection.rebuild_after_fallback_failed",
+                        session_id=session_id,
+                    )
 
             return Result.ok(tracker)
 
         except Exception as e:
+            duration_ms = (time.monotonic() - t0) * 1000
             log.exception(
                 "orchestrator.session.reconstruct_failed",
                 session_id=session_id,
                 error=str(e),
+                duration_ms=round(duration_ms, 2),
             )
             return Result.err(
                 PersistenceError(

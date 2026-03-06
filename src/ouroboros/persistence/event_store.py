@@ -4,14 +4,18 @@ Provides async methods for appending and replaying events using SQLAlchemy Core
 with aiosqlite backend.
 """
 
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 
 from ouroboros.core.errors import PersistenceError
 from ouroboros.events.base import BaseEvent
 from ouroboros.persistence.schema import events_table, metadata
+
+# Type alias for projector callbacks
+ProjectorCallback = Callable[[AsyncConnection, BaseEvent], Awaitable[None]]
 
 
 class EventStore:
@@ -34,13 +38,19 @@ class EventStore:
         await store.close()
     """
 
-    def __init__(self, database_url: str | None = None) -> None:
+    def __init__(
+        self,
+        database_url: str | None = None,
+        projectors: list[ProjectorCallback] | None = None,
+    ) -> None:
         """Initialize EventStore with database URL.
 
         Args:
             database_url: SQLAlchemy database URL.
                          For async SQLite: "sqlite+aiosqlite:///path/to/db.sqlite"
                          If not provided, defaults to ~/.ouroboros/ouroboros.db
+            projectors: Optional list of projector callbacks. Each is called
+                       with (conn, event) inside the same transaction as event insert.
         """
         if database_url is None:
             db_path = Path.home() / ".ouroboros" / "ouroboros.db"
@@ -48,6 +58,7 @@ class EventStore:
             database_url = f"sqlite+aiosqlite:///{db_path}"
         self._database_url = database_url
         self._engine: AsyncEngine | None = None
+        self._projectors: list[ProjectorCallback] = projectors or []
 
     async def initialize(self) -> None:
         """Initialize the database connection and create tables if needed.
@@ -89,6 +100,8 @@ class EventStore:
         try:
             async with self._engine.begin() as conn:
                 await conn.execute(events_table.insert().values(**event.to_db_dict()))
+                for projector in self._projectors:
+                    await projector(conn, event)
         except Exception as e:
             raise PersistenceError(
                 f"Failed to append event: {e}",
@@ -129,6 +142,9 @@ class EventStore:
                     events_table.insert(),
                     [event.to_db_dict() for event in events],
                 )
+                for event in events:
+                    for projector in self._projectors:
+                        await projector(conn, event)
         except Exception as e:
             raise PersistenceError(
                 f"Failed to append event batch: {e}",
