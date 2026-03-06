@@ -36,6 +36,7 @@ from ouroboros.observability.logging import get_logger
 
 if TYPE_CHECKING:
     from ouroboros.persistence.event_store import EventStore
+    from ouroboros.persistence.session_projector import SessionProjector
 
 log = get_logger(__name__)
 
@@ -194,13 +195,19 @@ class SessionRepository:
         - orchestrator.session.paused: Session paused for resumption
     """
 
-    def __init__(self, event_store: EventStore) -> None:
+    def __init__(
+        self,
+        event_store: EventStore,
+        projector: SessionProjector | None = None,
+    ) -> None:
         """Initialize repository with event store.
 
         Args:
             event_store: Event store for persistence.
+            projector: Optional session projector for O(1) reads.
         """
         self._event_store = event_store
+        self._projector = projector
 
     async def create_session(
         self,
@@ -425,6 +432,72 @@ class SessionRepository:
             Result containing reconstructed SessionTracker.
         """
         t0 = time.monotonic()
+
+        # Try projection path first
+        if self._projector is not None:
+            try:
+                projection = await self._projector.read(session_id)
+                if projection is not None:
+                    # Check freshness via a lightweight query for the latest event ID
+                    from sqlalchemy import select as sa_select
+                    from ouroboros.persistence.schema import events_table
+                    async with self._event_store._engine.begin() as conn:
+                        result = await conn.execute(
+                            sa_select(events_table.c.id)
+                            .where(events_table.c.aggregate_type == "session")
+                            .where(events_table.c.aggregate_id == session_id)
+                            .order_by(events_table.c.timestamp.desc(), events_table.c.id.desc())
+                            .limit(1)
+                        )
+                        latest_event_id = result.scalar()
+
+                    if (
+                        latest_event_id
+                        and projection.get("last_event_id") == latest_event_id
+                    ):
+                        # Projection is fresh — construct tracker from it
+                        try:
+                            tracker = SessionTracker(
+                                session_id=session_id,
+                                execution_id=projection["execution_id"],
+                                seed_id=projection["seed_id"],
+                                status=SessionStatus(projection["status"]),
+                                start_time=(
+                                    datetime.fromisoformat(projection["start_time"])
+                                    if isinstance(projection["start_time"], str)
+                                    else projection["start_time"]
+                                ),
+                                progress=projection.get("last_progress") or {},
+                                messages_processed=projection.get("messages_processed", 0),
+                            )
+                            duration_ms = (time.monotonic() - t0) * 1000
+                            log.info(
+                                "orchestrator.session.reconstructed",
+                                session_id=session_id,
+                                status=tracker.status.value,
+                                messages_processed=tracker.messages_processed,
+                                event_count_replayed=0,
+                                duration_ms=round(duration_ms, 2),
+                                path="projection",
+                            )
+                            return Result.ok(tracker)
+                        except (KeyError, ValueError):
+                            # Corrupt projection — fall through to replay
+                            log.warning(
+                                "session.projection.corrupt_fallback",
+                                session_id=session_id,
+                            )
+                    else:
+                        log.info(
+                            "session.projection.stale_fallback",
+                            session_id=session_id,
+                        )
+            except Exception:
+                log.warning(
+                    "session.projection.read_failed",
+                    session_id=session_id,
+                )
+
         try:
             events = await self._event_store.replay("session", session_id)
 
@@ -493,6 +566,16 @@ class SessionRepository:
                 duration_ms=round(duration_ms, 2),
                 path="replay",
             )
+
+            # Rebuild projection as side effect so next read is O(1)
+            if self._projector is not None:
+                try:
+                    await self._projector.rebuild(self._event_store, session_id)
+                except Exception:
+                    log.warning(
+                        "session.projection.rebuild_after_fallback_failed",
+                        session_id=session_id,
+                    )
 
             return Result.ok(tracker)
 
